@@ -1,11 +1,10 @@
-from exceptiongroup import catch
 from fastmcp import FastMCP
-import requests
+import httpx
 
 mcp = FastMCP("PoshBot MCP")
 
-@mcp.tool()
-def get_seller_data(seller_id: str):
+@mcp.tool
+async def get_seller_data(seller_id: str):
     """
     Retrieves seller statistics and bot data from an external API.
 
@@ -22,13 +21,29 @@ def get_seller_data(seller_id: str):
               On failure, returns a dictionary with an error message:
               {"msg": "Seller data is not found"}
     """
-    api = "https://stage.goshd.com/api/posh_bot/"+str(seller_id)+"/posh_bot_stats"
+    api = f"https://stage.goshd.com/api/posh_bot/{seller_id}/posh_bot_stats"
     try:
-        response = requests.get(api)
-        return response
+        async with httpx.AsyncClient() as client:
+            response = await client.get(api)
+            if response.status_code == 200:
+                return response.json()
+            return {"msg": "Seller data is not found"}
     except Exception as e:
-        return { "msg" : "Seller data is not found"}
+        return {"msg": str(e)}
+
+
+@mcp.tool()
+def get_temperature(city: str) -> str:
+    """
+    Gets the temperature for the given city
+    Args:
+        city: str
+
+    Returns: str
+
+    """
+    return f"The temperature in the given city is 25 degrees Celsius"
 
 
 if __name__ == '__main__':
-    mcp.run()
+    mcp.run(transport="sse", port=8001)
