@@ -1,18 +1,17 @@
-import json
-from statistics import mean, median
 from typing import Optional
 
 from fastmcp import FastMCP
 import httpx
 
-mcp = FastMCP("PoshBot MCP")
+from posh_listing_search import (
+    POSH_API_BASE,
+    HTTP_TIMEOUT_SECONDS,
+    build_search_request,
+    normalize_price_range,
+    find_listings,
+)
 
-# Poshmark server (goshposh/server) base URL. The same host already serves posh_bot_stats.
-POSH_API_BASE = "https://stage.goshd.com/api"
-LISTING_URL = "https://poshmark.com/listing/{listing_id}"
-HTTP_TIMEOUT_SECONDS = 15
-MAX_RESULTS = 20
-PRICE_CEILING = 1_000_000.0  # used when only min_price is given
+mcp = FastMCP("PoshBot MCP")
 
 
 @mcp.tool
@@ -42,125 +41,6 @@ async def get_seller_data(seller_id: str):
             return {"msg": "Seller data is not found"}
     except Exception as e:
         return {"msg": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Similar listings: backed by the Poshmark server's listing search, GET /api/posts
-# (goshposh/server lib/api_app.rb `get '/posts'`). The search request is sent as the
-# `request` query parameter, JSON encoded, exactly as the iOS/web clients send it.
-# Schema: goshposh/server/docs/post_search/openapi_spec/components/requests.yaml
-# ---------------------------------------------------------------------------
-
-def _build_search_request(
-    query: str,
-    brand: Optional[str],
-    department_id: Optional[str],
-    category_id: Optional[str],
-    category_feature_id: Optional[str],
-    condition: Optional[str],
-    price_range: Optional[tuple],
-    currency_code: str,
-    sort_by: str,
-    count: int,
-) -> dict:
-    filters: dict = {"inventory_status": ["available"]}
-    if brand:
-        filters["brand"] = [brand]
-    if department_id:
-        filters["department"] = [department_id]
-    if category_id:
-        filters["category_v2"] = [category_id]
-    if category_feature_id:
-        filters["category_feature"] = [category_feature_id]
-    if condition:
-        filters["condition"] = [condition]
-    if price_range:
-        low, high = price_range
-        filters["price_amount_range"] = [{
-            "min": {"val": f"{low:.2f}", "currency_code": currency_code},
-            "max": {"val": f"{high:.2f}", "currency_code": currency_code},
-        }]
-    return {
-        "query": query or "",
-        "filters": filters,
-        "sort_by": sort_by,
-        "count": str(max(1, min(count, MAX_RESULTS))),
-    }
-
-
-async def _search_posts(search_request: dict) -> dict:
-    """Calls GET /api/posts on the Poshmark server and returns the parsed JSON body."""
-    params = {
-        "request": json.dumps(search_request),
-        "app_type": "web",
-        "domain": "us",
-    }
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT_SECONDS) as client:
-        response = await client.get(f"{POSH_API_BASE}/posts", params=params)
-        if response.status_code != 200:
-            raise RuntimeError(
-                f"Poshmark search returned HTTP {response.status_code}: {response.text[:200]}"
-            )
-        return response.json()
-
-
-def _money(amount: Optional[dict]) -> Optional[float]:
-    try:
-        return float(amount["val"]) if amount and amount.get("val") is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
-def _compact_listing(post: dict) -> dict:
-    """Keeps only the fields a shopper cares about so the model is not flooded with JSON."""
-    catalog = post.get("catalog") or {}
-    features = catalog.get("category_feature_objs") or []
-    price_amount = post.get("price_amount") or {}
-    return {
-        "id": post.get("id"),
-        "title": post.get("title"),
-        "brand": post.get("brand"),
-        "price": _money(price_amount),
-        "original_price": _money(post.get("original_price_amount")),
-        "currency": price_amount.get("currency_code"),
-        "condition": post.get("condition"),
-        "size": post.get("size"),
-        "department": (catalog.get("department_obj") or {}).get("display"),
-        "category": (catalog.get("category_obj") or {}).get("display"),
-        "subcategory": features[0].get("display") if features else None,
-        "seller_username": post.get("creator_username"),
-        "inventory_status": (post.get("inventory") or {}).get("status"),
-        "url": LISTING_URL.format(listing_id=post.get("id")),
-        "picture_url": post.get("picture_url"),
-    }
-
-
-def _price_summary(listings: list) -> dict:
-    prices = [l["price"] for l in listings if l.get("price") is not None]
-    if not prices:
-        return {"count": 0}
-    return {
-        "count": len(prices),
-        "min": min(prices),
-        "max": max(prices),
-        "average": round(mean(prices), 2),
-        "median": round(median(prices), 2),
-    }
-
-
-async def _find_listings(search_request: dict, exclude_listing_id: Optional[str]) -> dict:
-    body = await _search_posts(search_request)
-    posts = body.get("data") or []
-    listings = [
-        _compact_listing(p) for p in posts
-        if not exclude_listing_id or p.get("id") != exclude_listing_id
-    ]
-    return {
-        "listings": listings,
-        "price_summary": _price_summary(listings),
-        "total_matching_on_poshmark": body.get("total_listing_count"),
-        "search_used": search_request,
-    }
 
 
 @mcp.tool
@@ -228,18 +108,20 @@ async def find_similar_listings(
         On failure returns {"msg": "<error>"}.
     """
     try:
-        price_range = None
-        if min_price is not None or max_price is not None:
-            low = max(0.0, float(min_price)) if min_price is not None else 0.0
-            high = float(max_price) if max_price is not None else PRICE_CEILING
-            if high < low:
-                low, high = high, low
-            price_range = (low, high)
-        search_request = _build_search_request(
-            query, brand, department_id, category_id, category_feature_id,
-            condition, price_range, currency_code, sort_by, count,
+        price_range = normalize_price_range(min_price, max_price)
+        search_request = build_search_request(
+            query=query,
+            brand=brand,
+            department_id=department_id,
+            category_id=category_id,
+            category_feature_id=category_feature_id,
+            condition=condition,
+            price_range=price_range,
+            currency_code=currency_code,
+            sort_by=sort_by,
+            count=count,
         )
-        result = await _find_listings(search_request, exclude_listing_id)
+        result = await find_listings(search_request, exclude_listing_id)
         if price_range:
             result["price_range_used"] = {
                 "min": round(price_range[0], 2), "max": round(price_range[1], 2), "currency": currency_code,
