@@ -18,7 +18,7 @@ POSH_API_BASE = "https://stage.goshd.com/api"
 LISTING_URL = "https://poshmark.com/listing/{listing_id}"
 HTTP_TIMEOUT_SECONDS = 15
 MAX_RESULTS = 20
-PRICE_CEILING = 1_000_000.0  # used when only min_price is given
+PRICE_BAND_PERCENT = 5.0  # similar-price band: listing price -5% .. +5%
 
 
 def build_search_request(
@@ -59,15 +59,18 @@ def build_search_request(
     }
 
 
-def normalize_price_range(min_price: Optional[float], max_price: Optional[float]) -> Optional[tuple]:
-    """Turns optional min/max into a (low, high) pair, or None when neither is given."""
-    if min_price is None and max_price is None:
+def price_band(listing_price: Optional[float], percent: float = PRICE_BAND_PERCENT) -> Optional[tuple]:
+    """
+    Turns the listing price the client sent into the (min, max) range to search:
+    5% below and 5% above the price. Returns None when no price was given.
+    """
+    if listing_price is None:
         return None
-    low = max(0.0, float(min_price)) if min_price is not None else 0.0
-    high = float(max_price) if max_price is not None else PRICE_CEILING
-    if high < low:
-        low, high = high, low
-    return (low, high)
+    price = float(listing_price)
+    if price <= 0:
+        raise ValueError("listing_price must be a positive number")
+    factor = percent / 100.0
+    return (round(price * (1.0 - factor), 2), round(price * (1.0 + factor), 2))
 
 
 async def search_posts(search_request: dict) -> dict:
