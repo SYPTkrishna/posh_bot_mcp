@@ -15,7 +15,7 @@ import httpx
 
 # Poshmark server base URL. The same host also serves posh_bot_stats.
 POSH_API_BASE = "https://stage.goshd.com/api"
-LISTING_URL = "https://poshmark.com/listing/{listing_id}"
+LISTING_URL = "https://stage.goshd.com/listing/{listing_id}"
 HTTP_TIMEOUT_SECONDS = 15
 MAX_RESULTS = 20
 PRICE_BAND_PERCENT = 5.0  # similar-price band: listing price -5% .. +5%

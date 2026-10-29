@@ -3,6 +3,7 @@ from typing import Optional
 from fastmcp import FastMCP
 import httpx
 
+from posh_offers import fetch_active_offers
 from posh_listing_search import (
     POSH_API_BASE,
     HTTP_TIMEOUT_SECONDS,
@@ -131,6 +132,55 @@ async def find_similar_listings(
         return result
     except Exception as e:
         return {"msg": f"Could not fetch similar listings: {e}"}
+
+
+@mcp.tool
+async def get_active_offers(
+    post_id: str,
+    access_token: Optional[str] = None,
+    max_id: Optional[str] = None,
+):
+    """
+    Reads the offers currently open on one listing, for the seller who owns it.
+
+    Use this when the seller asks about offers on the listing they are looking at:
+    "any offers on this?", "what have people offered?", "how do the offers compare to
+    my price?". It only describes offers. It cannot accept, decline or counter one,
+    and it says nothing about whether the seller should.
+
+    Take post_id from the current listing's data: listing["id"].
+
+    Reading offers needs the seller's own access token. The conversation gives you one
+    as access_token in the listing data -- pass it straight through. Otherwise the server
+    falls back to its POSH_ACCESS_TOKEN environment variable. When neither works the tool
+    returns {"msg": "..."} saying so; repeat that to the seller rather than guessing at
+    offers.
+
+    Args:
+        post_id: Id of the listing whose offers to read.
+        access_token: The seller's access token from the listing data, when there is one.
+        max_id: Paging cursor from a previous call's next_max_id.
+
+    Returns:
+        dict with:
+          offers: list of {id, amount, currency, state, status_message,
+                  latest_offer_message, created_at, status_changed_at, buyer_username,
+                  type, is_bundle, bundle_item_count}
+          count: how many offers are open
+          single_item_offer_summary: {count, min, max} over offers for this listing
+                  alone -- bundle offers are left out because their amount covers
+                  several items and must not be compared with this listing's price
+          has_bundle_offers: whether any offer in the list is a bundle
+          next_max_id: cursor for the next page, when there is one
+        On failure returns {"msg": "<reason>"}.
+
+    status_message is already written for display by the server. Use it as it is
+    instead of describing the state in your own words.
+    """
+    try:
+        return await fetch_active_offers(post_id, max_id, access_token)
+    except Exception as e:
+        return {"msg": f"Could not fetch active offers: {e}"}
 
 
 @mcp.tool()
