@@ -88,9 +88,13 @@ async def find_similar_listings(
         the buyer just wants similar items
       - exclude_listing_id: listing["id"], so the current listing is not returned as its own match
 
-    The tool makes exactly one search. Similarity comes from brand, department and
-    category; there is no subcategory filter. If it returns no listings, you may call it
-    once more without brand.
+    The tool fills the list by itself. It searches with every filter first and, if that
+    gives fewer than `count` listings, widens the search one filter at a time (condition,
+    then brand, then the price band; department and category always stay) and appends
+    the broader matches after the exact ones. Each listing says which filters were
+    dropped to find it in matched_after_dropping ([] = exact match), and filters_relaxed
+    lists everything dropped overall. You do not need to call it again with fewer
+    filters.
 
     Args:
         query: Up to 5 important search words describing the item.
@@ -112,11 +116,14 @@ async def find_similar_listings(
         dict with:
           listings: list of {id, title, brand, price, original_price, currency, condition,
                     size, department, category, subcategory, seller_username,
-                    inventory_status, listed_at, url, picture_url}
+                    inventory_status, listed_at, url, picture_url, matched_after_dropping},
+                    exact matches first (unless a price or date sort was asked for)
+          exact_match_count: how many of them matched every filter
           price_summary: {count, min, max, average, median} over the returned listings
           price_range_used: {min, max, currency} when listing_price was given
           total_matching_on_poshmark: how many listings matched in total (may be null)
-          search_used: the filters that were applied
+          filters_relaxed: filters that were dropped to fill the list ([] if none)
+          search_used: the filters that were applied in the final attempt
         On failure returns {"msg": "<error>"}.
     """
     try:
