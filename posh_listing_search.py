@@ -30,9 +30,12 @@ SORT_OPTIONS = ("relevance_v2", "best_match", "added_desc", "price_asc", "price_
 # (2 hits where relevance finds 78 for the same words), so those orders are applied
 # here after collecting; the server is always queried with a relevance sort.
 LOCAL_SORTS = ("price_asc", "price_desc", "added_desc")
-# One request per tool call. The subcategory (category_feature) filter is never sent:
-# near-identical listings are filed under different subcategories, so it mostly removed
-# the matches we wanted. Brand, department and category are the similarity filters.
+# The subcategory (category_feature) filter is never sent: near-identical listings are
+# filed under different subcategories, so it mostly removed the matches we wanted.
+# When a search returns fewer listings than asked for, the remaining optional filters
+# are dropped one at a time in this order and the broader results are appended after
+# the exact ones. Department and category are never dropped.
+FALLBACK_ORDER = ("condition", "brand", "price_range")
 
 
 def build_search_request(
@@ -188,40 +191,88 @@ async def search_listings(
     exclude_listing_id: Optional[str] = None,
 ) -> dict:
     """
-    Makes exactly one search request with the filters given and returns compact
-    listings plus a price summary.
+    Searches with every filter given, then keeps widening until `count` listings are
+    collected or nothing is left to drop. Filters are dropped one at a time in
+    FALLBACK_ORDER (condition, brand, price band); department and category always stay.
+    Listings found with the exact filters come first; broader ones are appended and each
+    listing says which filters were dropped to find it (`matched_after_dropping`, empty
+    for an exact match). `filters_relaxed` lists everything dropped overall.
 
     The server is always queried with a relevance sort. price_asc, price_desc and
-    added_desc are applied to the returned list afterwards (see LOCAL_SORTS), because
+    added_desc are applied to the collected list afterwards (see LOCAL_SORTS), because
     the server's own price and date sorts use a much stricter matcher.
     """
     target = max(1, min(count, MAX_RESULTS))
     requested_sort = sort_by if sort_by in SORT_OPTIONS else DEFAULT_SORT
     server_sort = DEFAULT_SORT if requested_sort in LOCAL_SORTS else requested_sort
-    search_request = build_search_request(
-        query=query,
-        brand=brand,
-        department_id=department_id,
-        category_id=category_id,
-        condition=condition,
-        price_range=price_range,
-        currency_code=currency_code,
-        sort_by=server_sort,
-        count=target,
-    )
-    result = await find_listings(search_request, exclude_listing_id)
-    listings = result["listings"][:target]
+    filters = {"brand": brand, "condition": condition, "price_range": price_range}
+    relaxed: list = []
+    collected: dict = {}  # listing id -> listing, insertion order = exact first
+    exact_total = None
+    last_result: dict = {}
+    search_error = None
+    attempts = 0
+    while True:
+        attempts += 1
+        search_request = build_search_request(
+            query=query,
+            brand=filters["brand"],
+            department_id=department_id,
+            category_id=category_id,
+            condition=filters["condition"],
+            price_range=filters["price_range"],
+            currency_code=currency_code,
+            sort_by=server_sort,
+            count=target,
+        )
+        try:
+            last_result = await find_listings(search_request, exclude_listing_id)
+        except Exception as e:
+            # A widening attempt failed on the server side. Keep what earlier attempts
+            # found; a failed first attempt is a real error and propagates.
+            if not collected:
+                raise
+            logger.warning("listing search attempt %d failed, returning %d collected: %s", attempts, len(collected), e)
+            search_error = str(e)
+            break
+        if exact_total is None:
+            exact_total = last_result.get("total_matching_on_poshmark")
+        added = 0
+        for listing in last_result["listings"]:
+            if listing["id"] in collected or len(collected) >= target:
+                continue
+            listing["matched_after_dropping"] = list(relaxed)
+            collected[listing["id"]] = listing
+            added += 1
+        logger.info(
+            "listing search attempt %d: %d returned, %d new, %d/%d collected, relaxed=%s",
+            attempts, len(last_result["listings"]), added, len(collected), target, relaxed,
+        )
+        if len(collected) >= target:
+            break
+        next_drop = next((name for name in FALLBACK_ORDER if filters.get(name) is not None), None)
+        if next_drop is None:
+            break
+        filters[next_drop] = None
+        relaxed.append(next_drop)
+
+    listings = list(collected.values())
     if requested_sort == "price_asc":
         listings.sort(key=lambda l: (l["price"] is None, l["price"] or 0.0))
     elif requested_sort == "price_desc":
         listings.sort(key=lambda l: (l["price"] is None, -(l["price"] or 0.0)))
     elif requested_sort == "added_desc":
         listings.sort(key=lambda l: l.get("listed_at") or "", reverse=True)
-    logger.info("listing search returned %d listings (total %s)", len(listings), result.get("total_matching_on_poshmark"))
+    exact_count = sum(1 for l in listings if not l["matched_after_dropping"])
     return {
         "listings": listings,
+        "exact_match_count": exact_count,
         "price_summary": price_summary(listings),
-        "total_matching_on_poshmark": result.get("total_matching_on_poshmark"),
+        "filters_relaxed": relaxed,
+        "attempts": attempts,
+        "total_matching_exact": exact_total,
+        "total_matching_on_poshmark": last_result.get("total_matching_on_poshmark"),
         "sort_applied": requested_sort,
-        "search_used": result.get("search_used"),
+        "search_used": last_result.get("search_used"),
+        **({"search_error": search_error} if search_error else {}),
     }
