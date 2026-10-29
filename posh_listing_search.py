@@ -8,10 +8,14 @@ goshposh/server/docs/post_search/openapi_spec/components/requests.yaml
 """
 
 import json
+import logging
+import re
 from statistics import mean, median
 from typing import Optional
 
 import httpx
+
+logger = logging.getLogger("poshbot_mcp.listing_search")
 
 # Poshmark server base URL. The same host also serves posh_bot_stats.
 POSH_API_BASE = "https://stage.goshd.com/api"
@@ -19,6 +23,12 @@ LISTING_URL = "https://stage.goshd.com/listing/{listing_id}"
 HTTP_TIMEOUT_SECONDS = 15
 MAX_RESULTS = 20
 PRICE_BAND_PERCENT = 5.0  # similar-price band: listing price -5% .. +5%
+MAX_QUERY_WORDS = 5  # the search engine does best with a few strong words, not a full title
+DEFAULT_SORT = "relevance_v2"  # the same default the Poshmark apps use
+SORT_OPTIONS = ("relevance_v2", "best_match", "added_desc", "price_asc", "price_desc")
+# When a search comes back empty, filters are dropped one at a time in this order.
+# Department and category are never dropped: without them "similar" means nothing.
+FALLBACK_ORDER = ("category_feature_id", "condition", "brand", "price_range")
 
 
 def build_search_request(
@@ -30,10 +40,12 @@ def build_search_request(
     condition: Optional[str] = None,
     price_range: Optional[tuple] = None,
     currency_code: str = "USD",
-    sort_by: str = "best_match",
+    sort_by: str = DEFAULT_SORT,
     count: int = 10,
 ) -> dict:
     """Builds the JSON body for GET /api/posts. Only available listings are searched."""
+    if sort_by not in SORT_OPTIONS:
+        sort_by = DEFAULT_SORT
     filters: dict = {"inventory_status": ["available"]}
     if brand:
         filters["brand"] = [brand]
@@ -57,6 +69,16 @@ def build_search_request(
         "sort_by": sort_by,
         "count": str(max(1, min(count, MAX_RESULTS))),
     }
+
+
+def trim_query(query: Optional[str], max_words: int = MAX_QUERY_WORDS) -> str:
+    """
+    Keeps at most `max_words` words of the query. The model is asked to send only the
+    important words (brand + item type + a detail or two); this is the safety net for
+    when it pastes a whole title anyway.
+    """
+    words = re.findall(r"[^\s]+", query or "")
+    return " ".join(words[:max_words])
 
 
 def price_band(listing_price: Optional[float], percent: float = PRICE_BAND_PERCENT) -> Optional[tuple]:
@@ -136,6 +158,7 @@ def price_summary(listings: list) -> dict:
 
 async def find_listings(search_request: dict, exclude_listing_id: Optional[str] = None) -> dict:
     """Runs the search and returns compact listings plus a price summary."""
+    logger.info("listing search request: %s", search_request)
     body = await search_posts(search_request)
     posts = body.get("data") or []
     listings = [
@@ -148,3 +171,60 @@ async def find_listings(search_request: dict, exclude_listing_id: Optional[str] 
         "total_matching_on_poshmark": body.get("total_listing_count"),
         "search_used": search_request,
     }
+
+
+async def search_with_fallback(
+    query: str,
+    brand: Optional[str] = None,
+    department_id: Optional[str] = None,
+    category_id: Optional[str] = None,
+    category_feature_id: Optional[str] = None,
+    condition: Optional[str] = None,
+    price_range: Optional[tuple] = None,
+    currency_code: str = "USD",
+    sort_by: str = DEFAULT_SORT,
+    count: int = 10,
+    exclude_listing_id: Optional[str] = None,
+) -> dict:
+    """
+    Searches with every filter given, and if nothing comes back, retries with filters
+    dropped one at a time in FALLBACK_ORDER until something matches or nothing is left
+    to drop. The result reports which filters were dropped in `filters_relaxed` so the
+    model can tell the buyer the matches are broader than the exact item.
+    """
+    filters = {
+        "brand": brand,
+        "category_feature_id": category_feature_id,
+        "condition": condition,
+        "price_range": price_range,
+    }
+    relaxed: list = []
+    result: dict = {}
+    while True:
+        search_request = build_search_request(
+            query=query,
+            brand=filters["brand"],
+            department_id=department_id,
+            category_id=category_id,
+            category_feature_id=filters["category_feature_id"],
+            condition=filters["condition"],
+            price_range=filters["price_range"],
+            currency_code=currency_code,
+            sort_by=sort_by,
+            count=count,
+        )
+        result = await find_listings(search_request, exclude_listing_id)
+        logger.info(
+            "listing search returned %d listings (total %s), relaxed=%s",
+            len(result["listings"]), result.get("total_matching_on_poshmark"), relaxed,
+        )
+        if result["listings"]:
+            break
+        next_drop = next((name for name in FALLBACK_ORDER if filters.get(name) is not None), None)
+        if next_drop is None:
+            break
+        filters[next_drop] = None
+        relaxed.append(next_drop)
+    result["filters_relaxed"] = relaxed
+    result["attempts"] = len(relaxed) + 1
+    return result

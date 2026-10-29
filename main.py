@@ -1,3 +1,4 @@
+import logging
 from typing import Optional
 
 from fastmcp import FastMCP
@@ -8,9 +9,11 @@ from posh_listing_search import (
     POSH_API_BASE,
     HTTP_TIMEOUT_SECONDS,
     PRICE_BAND_PERCENT,
-    build_search_request,
+    MAX_QUERY_WORDS,
+    DEFAULT_SORT,
     price_band,
-    find_listings,
+    trim_query,
+    search_with_fallback,
 )
 
 mcp = FastMCP("PoshBot MCP")
@@ -57,7 +60,7 @@ async def find_similar_listings(
     currency_code: str = "USD",
     exclude_listing_id: Optional[str] = None,
     count: int = 10,
-    sort_by: str = "best_match",
+    sort_by: str = DEFAULT_SORT,
 ):
     """
     Finds other Poshmark listings similar to the one the buyer is looking at,
@@ -74,17 +77,26 @@ async def find_similar_listings(
     listings currently available on Poshmark are returned.
 
     Take the arguments from the current listing's data:
-      - query: the listing title (or brand + item type, e.g. "Ganni leopard beanie")
+      - query: AT MOST 5 important words: brand + item type + one or two distinguishing
+        details, e.g. "Rachel Roy bodycon dress" or "Ganni leopard beanie". Never the
+        full title, and no sizes. Anything past 5 words is cut off.
       - brand: listing["brand"]
       - department_id: listing["catalog"]["department"]
       - category_id: listing["catalog"]["category"]
-      - category_feature_id: listing["catalog"]["category_features"][0] (optional, narrows to the subcategory)
-      - condition: listing["condition"] (optional; one of nwt, ret, not_nwt, uln, ug, uf, wlsl, unsp)
-      - listing_price: listing["price"] (only for price questions)
+      - category_feature_id: listing["catalog"]["category_features"][0] (optional)
+      - condition: only when the buyer asks for a specific condition
+        (one of nwt, ret, not_nwt, uln, ug, uf, wlsl, unsp); otherwise leave it out
+      - listing_price: listing["price"], ONLY for price questions; leave it out when
+        the buyer just wants similar items
       - exclude_listing_id: listing["id"], so the current listing is not returned as its own match
 
+    If nothing matches with every filter applied, the tool retries by itself, dropping
+    filters one at a time (subcategory, then condition, then brand, then the price
+    band) and reports what it dropped in filters_relaxed. You do not need to call it
+    again with fewer filters.
+
     Args:
-        query: Free-text search words describing the item.
+        query: Up to 5 important search words describing the item.
         brand: Brand name to restrict to, e.g. "Ganni".
         department_id: Poshmark department id (e.g. Women, Men, Kids).
         category_id: Poshmark category id (e.g. Accessories, Shoes).
@@ -95,7 +107,8 @@ async def find_similar_listings(
         currency_code: Currency of listing_price, default USD.
         exclude_listing_id: Id of the listing being viewed, removed from results.
         count: How many listings to return (1-20, default 10).
-        sort_by: One of best_match, added_desc (newest), price_asc, price_desc.
+        sort_by: relevance_v2 (default, same as the Poshmark app), price_asc, price_desc,
+            added_desc (newest) or best_match. Use price_asc for price questions.
 
     Returns:
         dict with:
@@ -104,14 +117,15 @@ async def find_similar_listings(
                     inventory_status, url, picture_url}
           price_summary: {count, min, max, average, median} over the returned listings
           price_range_used: {min, max, currency} when listing_price was given
+          filters_relaxed: filters that had to be dropped to find anything ([] if none)
           total_matching_on_poshmark: how many listings matched in total (may be null)
-          search_used: the filters that were applied
+          search_used: the filters that were applied in the final attempt
         On failure returns {"msg": "<error>"}.
     """
     try:
         price_range = price_band(listing_price, PRICE_BAND_PERCENT)
-        search_request = build_search_request(
-            query=query,
+        result = await search_with_fallback(
+            query=trim_query(query, MAX_QUERY_WORDS),
             brand=brand,
             department_id=department_id,
             category_id=category_id,
@@ -121,8 +135,8 @@ async def find_similar_listings(
             currency_code=currency_code,
             sort_by=sort_by,
             count=count,
+            exclude_listing_id=exclude_listing_id,
         )
-        result = await find_listings(search_request, exclude_listing_id)
         if price_range:
             result["listing_price"] = float(listing_price)
             result["price_range_used"] = {
@@ -197,4 +211,5 @@ def get_temperature(city: str) -> str:
 
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     mcp.run(transport="sse", port=8001)
