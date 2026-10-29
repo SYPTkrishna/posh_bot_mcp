@@ -5,6 +5,7 @@ from fastmcp import FastMCP
 import httpx
 
 from posh_offers import fetch_active_offers
+from posh_post_update import update_listing as apply_listing_update
 from posh_listing_search import (
     POSH_API_BASE,
     HTTP_TIMEOUT_SECONDS,
@@ -198,6 +199,60 @@ async def get_active_offers(
         return await fetch_active_offers(post_id, max_id, access_token)
     except Exception as e:
         return {"msg": f"Could not fetch active offers: {e}"}
+
+
+@mcp.tool
+async def update_listing(
+    post_id: str,
+    title: Optional[str] = None,
+    description: Optional[str] = None,
+    price: Optional[float] = None,
+    original_price: Optional[float] = None,
+    access_token: Optional[str] = None,
+):
+    """
+    Changes the title, description, price or original price of the seller's own
+    listing. This edits a real, live listing: call it only because the seller asked for
+    exactly this change, and pass only the fields they asked to change.
+
+    Use it after the seller gave a clear instruction with the value in it ("change the
+    price to 15", "use that description", "retitle it to ...") or confirmed a proposal
+    you showed them as current -> proposed. If a value is missing ("lower the price"),
+    ask for it instead of calling this.
+
+    Take post_id from the current listing's data: listing["id"]. The seller's token is
+    in the listing data as access_token; pass it straight through.
+
+    Args:
+        post_id: Id of the listing to change.
+        title: New title, up to 80 characters.
+        description: New description, up to 1500 characters.
+        price: New listing price, a whole number in the listing's currency (no cents).
+        original_price: New original (retail) price, a whole number.
+        access_token: The seller's access token from the listing data.
+
+    Returns:
+        dict with:
+          updated: true when every requested field now reads back with the new value
+          changes: {field: {before, after}} for each field you asked to change, read
+                   back from the server after the update
+          listing: the listing as it is now (title, price, condition, size, url, ...)
+        On failure returns {"msg": "<reason>"} and the listing is unchanged. Read that
+        message out to the seller and do not claim the change was made.
+
+    Pictures, brand, category, size and condition are not changed by this tool.
+    """
+    try:
+        return await apply_listing_update(
+            post_id,
+            access_token=access_token,
+            title=title,
+            description=description,
+            price=price,
+            original_price=original_price,
+        )
+    except Exception as e:
+        return {"msg": f"Could not update the listing: {e}"}
 
 
 @mcp.tool()
