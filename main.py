@@ -13,7 +13,7 @@ from posh_listing_search import (
     DEFAULT_SORT,
     price_band,
     trim_query,
-    search_with_fallback,
+    search_listings,
 )
 
 mcp = FastMCP("PoshBot MCP")
@@ -54,7 +54,6 @@ async def find_similar_listings(
     brand: Optional[str] = None,
     department_id: Optional[str] = None,
     category_id: Optional[str] = None,
-    category_feature_id: Optional[str] = None,
     condition: Optional[str] = None,
     listing_price: Optional[float] = None,
     currency_code: str = "USD",
@@ -83,24 +82,21 @@ async def find_similar_listings(
       - brand: listing["brand"]
       - department_id: listing["catalog"]["department"]
       - category_id: listing["catalog"]["category"]
-      - category_feature_id: listing["catalog"]["category_features"][0] (optional)
       - condition: only when the buyer asks for a specific condition
         (one of nwt, ret, not_nwt, uln, ug, uf, wlsl, unsp); otherwise leave it out
       - listing_price: listing["price"], ONLY for price questions; leave it out when
         the buyer just wants similar items
       - exclude_listing_id: listing["id"], so the current listing is not returned as its own match
 
-    If nothing matches with every filter applied, the tool retries by itself, dropping
-    filters one at a time (subcategory, then condition, then brand, then the price
-    band) and reports what it dropped in filters_relaxed. You do not need to call it
-    again with fewer filters.
+    The tool makes exactly one search. Similarity comes from brand, department and
+    category; there is no subcategory filter. If it returns no listings, you may call it
+    once more without brand.
 
     Args:
         query: Up to 5 important search words describing the item.
         brand: Brand name to restrict to, e.g. "Ganni".
         department_id: Poshmark department id (e.g. Women, Men, Kids).
         category_id: Poshmark category id (e.g. Accessories, Shoes).
-        category_feature_id: Poshmark subcategory id (e.g. Belts, Hats).
         condition: Condition code to restrict to.
         listing_price: Price of the listing being viewed. When given, only listings
             priced from 5% below to 5% above it are returned.
@@ -108,28 +104,28 @@ async def find_similar_listings(
         exclude_listing_id: Id of the listing being viewed, removed from results.
         count: How many listings to return (1-20, default 10).
         sort_by: relevance_v2 (default, same as the Poshmark app), price_asc, price_desc,
-            added_desc (newest) or best_match. Use price_asc for price questions.
+            added_desc (newest) or best_match. Use price_asc for price questions. Price
+            and date orders are applied to the collected results, so they never reduce
+            how many listings are found.
 
     Returns:
         dict with:
           listings: list of {id, title, brand, price, original_price, currency, condition,
                     size, department, category, subcategory, seller_username,
-                    inventory_status, url, picture_url}
+                    inventory_status, listed_at, url, picture_url}
           price_summary: {count, min, max, average, median} over the returned listings
           price_range_used: {min, max, currency} when listing_price was given
-          filters_relaxed: filters that had to be dropped to find anything ([] if none)
           total_matching_on_poshmark: how many listings matched in total (may be null)
-          search_used: the filters that were applied in the final attempt
+          search_used: the filters that were applied
         On failure returns {"msg": "<error>"}.
     """
     try:
         price_range = price_band(listing_price, PRICE_BAND_PERCENT)
-        result = await search_with_fallback(
+        result = await search_listings(
             query=trim_query(query, MAX_QUERY_WORDS),
             brand=brand,
             department_id=department_id,
             category_id=category_id,
-            category_feature_id=category_feature_id,
             condition=condition,
             price_range=price_range,
             currency_code=currency_code,
